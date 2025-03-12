@@ -187,12 +187,6 @@ server <- function(input, output, session) {
       dir.create(output_dir, recursive = TRUE)
     }
     
-    summary_table <-  data.frame(
-      filename = character(),
-      n_regions = numeric(),
-      stringsAsFactors = FALSE
-    )
-    
     summary_table <- data.frame(
       filename = character(),
       dataset = character(),
