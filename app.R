@@ -11,6 +11,9 @@ ui <- fluidPage(
   
   sidebarLayout(
     sidebarPanel(
+      
+      tags$a(href = "example.xlsx", "Download Example XLSX File", target = "_blank"),
+      
       # File input for selecting multiple .xlsx files
       fileInput("file_input", "Choose Excel Files", multiple = TRUE, accept = c(".xlsx")),
       
@@ -132,7 +135,7 @@ server <- function(input, output, session) {
             tags$th("N Any Quality"),
             tags$th("N Signif Quality"),
             tags$th("P.adj"),
-            tags$th("Log2FC"),
+            tags$th("|Log2FC|"),
             tags$th("Action")
           )
         ),
@@ -201,26 +204,27 @@ server <- function(input, output, session) {
       stringsAsFactors = FALSE
     )
     
+    # init the files counter to make prefix
     file_name_ix <- 1
+    
     # Start progress bar
     withProgress(message = "Processing files", value = 0, {
       # Loop through each uploaded file
       
-      files_list <- sort(input$file_input$name)
-      input_sorted <- input$file_input[order(input$file_input$name),]
-      
-      for (file_idx in seq_along(input_sorted$name)) {
-        file <- input_sorted$datapath[file_idx]
-        file_name <- tools::file_path_sans_ext(input_sorted$name[file_idx])
+      for (rule_idx in 1:nrow(table_data$data)) {
+        rule <- table_data$data[rule_idx, ]
         
-        # Read the Excel file
-        data <- read_excel(file)
-        data <- data[,1:9]
-        colnames(data) <- c("chr", "start", "end", "width", "regulation", "n_any_quality", "n_signif_quality", "p_adj", "log2FC")
+        files_list <- sort(input$file_input$name)
+        input_sorted <- input$file_input[order(input$file_input$name),]
         
-        # Apply each rule to the data
-        for (rule_idx in 1:nrow(table_data$data)) {
-          rule <- table_data$data[rule_idx, ]
+        for (file_idx in seq_along(input_sorted$name)) {
+          file <- input_sorted$datapath[file_idx]
+          file_name <- tools::file_path_sans_ext(input_sorted$name[file_idx])
+          
+          # Read the Excel file
+          data <- read_excel(file)
+          data <- data[,1:9]
+          colnames(data) <- c("chr", "start", "end", "width", "regulation", "n_any_quality", "n_signif_quality", "p_adj", "log2FC")
           
           # Apply filtering rules using base R
           filter_conditions <- TRUE
@@ -229,7 +233,7 @@ server <- function(input, output, session) {
             if (rule$chr == "noX") fvec <- "chrX"
             if (rule$chr == "noY") fvec <- "chrY"
             if (rule$chr == "noXY") fvec <- c("chrX", "chrY")
-          
+            
             filter_conditions <- filter_conditions & !(data$chr %in% fvec)
           }
           if (rule$width != 1000000) {
@@ -253,7 +257,7 @@ server <- function(input, output, session) {
           
           # Filter the data
           filtered_data <- data[filter_conditions, ]
-       
+          
           # Generate directory name based on non-default parameters
           non_default_params <- c()
           non_default_params <- c(non_default_params, paste0("Chr=", rule$chr))
@@ -303,7 +307,7 @@ server <- function(input, output, session) {
           # Save as .bed
           bed_file <- file.path(rule_output_dir, paste0(out_name, ".bed"))
           write.table(filtered_data[,1:3], bed_file, sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
-
+          
           # Save as .xlsx using writexl
           xlsx_file <- file.path(rule_output_dir, paste0(out_name, ".xlsx"))
           write_xlsx(filtered_data[,1:3], xlsx_file)
@@ -326,10 +330,10 @@ server <- function(input, output, session) {
           summary_table <- rbind(summary_table, tmp_summary)
           file_name_ix <- file_name_ix + 1
         }
-        
-        
+
         # Update progress bar
-        incProgress(1 / length(input_sorted$name), detail = paste("Processing file", file_idx, "of", length(input_sorted$name)))
+        #incProgress(1 / length(input_sorted$name), detail = paste("Processing file", file_idx, "of", length(input_sorted$name)))
+        incProgress(1 / nrow(table_data$data), detail = paste("Processing rule", rule_idx, "of", nrow(table_data$data)))
       }
     })
     
