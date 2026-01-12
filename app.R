@@ -1,181 +1,341 @@
 options(shiny.maxRequestSize = 50*1024^2)
 
 library(shiny)
-library(readxl)  # For reading .xlsx files
-library(writexl)  # For writing .xlsx files
-library(tools)  # For file extensions
+library(readxl)
+library(writexl)
+library(tools)
 library(stringr)
-# Define UI
+
 ui <- fluidPage(
-  titlePanel("Filtering out overlap files obtained from ChIP-seq pipeline"),
+  titlePanel("Dynamic Filtering for ChIP-seq Pipeline Output"),
   
   sidebarLayout(
     sidebarPanel(
+      helpText(tags$span("Note: Columns containing '_vs_' will be ignored during file upload.", style = "color: #d9534f;")),
+      fileInput("file_input", "Choose Excel File", multiple = FALSE, accept = c(".xlsx")),
       
-      tags$a(href = "example.xlsx", "Download Example XLSX File", target = "_blank"),
-      
-      # File input for selecting multiple .xlsx files
-      fileInput("file_input", "Choose Excel Files", multiple = TRUE, accept = c(".xlsx")),
-      
-      # Input fields for the filtering rules
       textInput("dataset", "Dataset", value = "DatasetID"),
-      helpText("Dataset: A prefix text to give more detailed explanation of data. This will be used in the output directory and filenames."),
+      helpText("Dataset: A prefix text for the output directory and filenames."),
       
-      selectInput("chr", "Chromosome", choices = c("ALL", "noX", "noY", "noXY"), selected = "ALL"),
-      helpText("Chromosome: Refers to the 'seqnames' column in the input file. Use this to exclude sex chromosomes from analysis."),
+      uiOutput("dynamic_filters"),
       
-      numericInput("width", "Width (<= 1000000)", value = 100000, min = 1, max = 1000000),
-      helpText("Width: Region size. This parameter allows you to filter regions smaller than or equal to the specified number."),
-      
-       # Segmented toggle for n_any_quality and n_signif_quality
-      radioButtons("quality_toggle", "Quality Type",
-                   choices = c("N Any Quality" = "n_any_quality", "N Signif Quality" = "n_signif_quality"),
-                   selected = "n_any_quality"),
-      uiOutput("quality_input"),  # Dynamic input for quality
-      helpText("Quality Type: A comma-separated list (without spaces) of numbers from 1 to 5, representing the overlap across five different counting methods."),
-      helpText("n_any_quality: The number of methods overlapping in a given region, regardless of statistical significance."),
-      helpText("n_signif_quality: The number of methods overlapping in a region, but only if the overlap is statistically significant. For example, if n_signif_quality = 4,5, it means that only significant regions overlapped by at least four methods are considered."),
-      
-      numericInput("p_adj", "P.adj", value = 0.05, min = 0),
-      helpText("P.adj (less than): Significance of the regions. Use this to filter regions based on their adjusted p-value."),
-      
-      numericInput("log2FC", "|Log2FC|", value = 0.0),
-      helpText("log2FC (greater than): Absolute value of log2 fold change. Use this to filter regions based on their fold change."),
- 
-      selectInput("regulation", "Regulation", choices = c("ALL", "positive", "negative"), selected = "ALL"),
-      helpText("Regulation: Positive/negative (based on the sign of the 'log2FC' column). Use this to extract up/down regulated regions."),
-      
-      actionButton("add_btn", "Add parameters for analysis"),
+      actionButton("add_btn", "Add Rule"),
       br(), br(),
       actionButton("apply_rules_btn", "Apply Rules and Save Output"),
       br(), br(),
-      uiOutput("download_ui")  # Download link for the zip archive
+      uiOutput("download_ui")
     ),
     
     mainPanel(
+      uiOutput("file_validation_message"),
       uiOutput("dynamic_table"),
-      verbatimTextOutput("file_info")  # Display file information
+      verbatimTextOutput("file_info")
     )
   )
 )
 
-# Define server logic
 server <- function(input, output, session) {
   
-  # Reactive value to store the table data (filtering rules)
-  table_data <- reactiveValues(data = data.frame(
-    dataset = character(),
-    chr = character(),
-    width = numeric(),
-    regulation = character(),
-    n_any_quality = character(),
-    n_signif_quality = character(),
-    p_adj = numeric(),
-    log2FC = numeric(),
-    stringsAsFactors = FALSE
-  ))
+  # Reactive values
+  file_data <- reactiveValues(
+    data = NULL,
+    dynamic_cols = NULL,
+    num_cols = NULL,
+    char_cols = NULL,
+    is_valid = FALSE,
+    validation_msg = ""
+  )
   
-  # Dynamic input for quality based on the segmented toggle
-  output$quality_input <- renderUI({
-    if (input$quality_toggle == "n_any_quality") {
-      textInput("n_any_quality", "N Any Quality (comma-separated)", value = "3,4,5")
+  table_data <- reactiveValues(data = data.frame(stringsAsFactors = FALSE))
+  zip_path <- reactiveVal(NULL)
+  
+  # Observe file input
+  observeEvent(input$file_input, {
+    if (is.null(input$file_input)) {
+      file_data$is_valid <- FALSE
+      file_data$data <- NULL
+      file_data$dynamic_cols <- NULL
+      file_data$num_cols <- NULL
+      file_data$char_cols <- NULL
+      file_data$validation_msg <- "No file uploaded yet."
+      return()
+    }
+    
+    tryCatch({
+      data <- read_excel(input$file_input$datapath)
+      
+      if (ncol(data) < 4) {
+        file_data$is_valid <- FALSE
+        file_data$validation_msg <- paste("Error: File must have at least 4 columns (chr/seqnames, start, end and column for filtering). Current file has", ncol(data), "columns.")
+        return()
+      }
+      
+      col_names_lower <- tolower(colnames(data))
+      chr_idx <- which(col_names_lower == "chr" | col_names_lower == "seqnames")
+      start_idx <- which(col_names_lower == "start")
+      end_idx <- which(col_names_lower == "end")
+      
+      if (length(chr_idx) == 0 || length(start_idx) == 0 || length(end_idx) == 0) {
+        file_data$is_valid <- FALSE
+        file_data$validation_msg <- "Error: File must contain 'chr' or 'seqnames', 'start', and 'end' columns (case-insensitive)."
+        return()
+      }
+      
+      # Rename seqnames to chr if present
+      if (col_names_lower[chr_idx] == "seqnames") {
+        colnames(data)[chr_idx] <- "chr"
+      }
+      
+      required_indices <- c(chr_idx, start_idx, end_idx)
+      dynamic_indices <- setdiff(1:ncol(data), required_indices)
+      all_dynamic_names <- colnames(data)[dynamic_indices]
+      
+      # Filter out columns containing "_vs_"
+      dynamic_col_names <- all_dynamic_names[!grepl("_vs_", all_dynamic_names, ignore.case = TRUE)]
+      
+      if (length(dynamic_col_names) < 1) {
+        file_data$is_valid <- FALSE
+        file_data$validation_msg <- "Error: File must have at least one dynamic column beyond chr, start, and end (excluding columns with '_vs_')."
+        return()
+      }
+      
+      num_cols <- c()
+      char_cols <- c()
+      
+      for (col in dynamic_col_names) {
+        if (is.numeric(data[[col]])) {
+          num_cols <- c(num_cols, col)
+        } else {
+          char_cols <- c(char_cols, col)
+        }
+      }
+      
+      file_data$data <- data
+      file_data$dynamic_cols <- dynamic_col_names
+      file_data$num_cols <- num_cols
+      file_data$char_cols <- char_cols
+      file_data$is_valid <- TRUE
+      file_data$validation_msg <- paste("File loaded successfully with", length(dynamic_col_names), "dynamic columns.")
+      
+      table_data$data <- data.frame(stringsAsFactors = FALSE)
+      
+    }, error = function(e) {
+      file_data$is_valid <- FALSE
+      file_data$validation_msg <- paste("Error reading file:", e$message)
+    })
+  })
+  
+  # Render validation message
+  output$file_validation_message <- renderUI({
+    if (is.null(input$file_input)) {
+      return(NULL)
+    }
+    
+    if (file_data$is_valid) {
+      div(class = "alert alert-success", file_data$validation_msg)
     } else {
-      textInput("n_signif_quality", "N Signif Quality (comma-separated)", value = "3,4,5")
+      div(class = "alert alert-danger", file_data$validation_msg)
     }
   })
   
-  # Observe the "Add Rule" button click
-  observeEvent(input$add_btn, {
-    # Add the new rule to the table data
-    new_row <- data.frame(
-      dataset = input$dataset,  # Include dataset in the rule
-      chr = input$chr,
-      width = input$width,
-      regulation = input$regulation,
-      n_any_quality = if (input$quality_toggle == "n_any_quality") input$n_any_quality else "",
-      n_signif_quality = if (input$quality_toggle == "n_signif_quality") input$n_signif_quality else "",
-      p_adj = input$p_adj,
-      log2FC = input$log2FC,
-      stringsAsFactors = FALSE
-    )
-    table_data$data <- rbind(table_data$data, new_row)
-  })
-  
-  # Render the dynamic table with delete buttons
-  output$dynamic_table <- renderUI({
-    if (nrow(table_data$data) == 0) {
-      return("No rules added yet.")
-    } else {
-      # Create a table with a delete button for each row
-      table_rows <- lapply(1:nrow(table_data$data), function(i) {
-        tags$tr(
-          tags$td(table_data$data[i, "dataset"]),  # Display dataset
-          tags$td(table_data$data[i, "chr"]),
-          tags$td(table_data$data[i, "width"]),
-          tags$td(table_data$data[i, "regulation"]),
-          tags$td(table_data$data[i, "n_any_quality"]),
-          tags$td(table_data$data[i, "n_signif_quality"]),
-          tags$td(table_data$data[i, "p_adj"]),
-          tags$td(table_data$data[i, "log2FC"]),
-          tags$td(
-            actionButton(paste0("delete_", i), "Delete", class = "btn-danger")
+  # Render dynamic filters
+  output$dynamic_filters <- renderUI({
+    if (!file_data$is_valid) {
+      return(NULL)
+    }
+    
+    filter_list <- list()
+    
+    # Chromosome filter first
+    filter_list[[length(filter_list) + 1]] <- 
+      div(
+        style = "margin-bottom: 8px;",
+        tags$label("Chromosome:", style = "display: block; margin-bottom: 3px; font-weight: bold; font-size: 13px;"),
+        selectInput("chr_filter", NULL, 
+                    choices = c("ALL", "noX", "noY", "noXY"),
+                    selected = "ALL",
+                    width = "100%")
+      )
+    
+    # Numeric filters
+    for (col in file_data$num_cols) {
+      filter_list[[length(filter_list) + 1]] <- 
+        div(
+          style = "margin-bottom: 8px;",
+          tags$label(col, style = "display: block; margin-bottom: 3px; font-weight: bold; font-size: 13px;"),
+          fluidRow(
+            column(5, selectInput(paste0("op_", col), NULL,
+                                  choices = c("<" = "lt", "<=" = "le", "=" = "eq", 
+                                              ">=" = "ge", ">" = "gt"),
+                                  selected = "lt",
+                                  width = "100%")),
+            column(7, numericInput(paste0("val_", col), NULL, value = NA, width = "100%"))
           )
         )
-      })
+    }
+    
+    # Character filters
+    for (col in file_data$char_cols) {
+      unique_vals <- unique(na.omit(file_data$data[[col]]))
+      filter_list[[length(filter_list) + 1]] <- 
+        div(
+          style = "margin-bottom: 8px;",
+          selectizeInput(paste0("val_", col), col, 
+                         choices = unique_vals,
+                         multiple = TRUE,
+                         options = list(create = FALSE),
+                         width = "100%")
+        )
+    }
+    
+    filter_list
+  })
+  
+  # Add rule button
+  observeEvent(input$add_btn, {
+    if (!file_data$is_valid) {
+      showNotification("Please upload a valid file first.", type = "error")
+      return()
+    }
+    
+    new_row <- data.frame(
+      dataset = input$dataset,
+      chr = input$chr_filter,
+      stringsAsFactors = FALSE
+    )
+    
+    # Add numeric filters
+    for (col in file_data$num_cols) {
+      op_val <- input[[paste0("op_", col)]]
+      num_val <- input[[paste0("val_", col)]]
       
-      # Combine rows into a table
-      tags$table(
-        class = "table",
-        tags$thead(
-          tags$tr(
-            tags$th("Dataset"),  # Add Dataset column
-            tags$th("Chromosome"),
-            tags$th("Width"),
-            tags$th("Regulation"),
-            tags$th("N Any Quality"),
-            tags$th("N Signif Quality"),
-            tags$th("P.adj"),
-            tags$th("|Log2FC|"),
-            tags$th("Action")
-          )
-        ),
-        tags$tbody(table_rows)
-      )
+      if (!is.na(num_val)) {
+        new_row[[paste0(col, "_op")]] <- op_val
+        new_row[[paste0(col, "_val")]] <- num_val
+      }
+    }
+    
+    # Add character filters
+    for (col in file_data$char_cols) {
+      char_vals <- input[[paste0("val_", col)]]
+      if (!is.null(char_vals) && length(char_vals) > 0) {
+        new_row[[paste0(col, "_vals")]] <- paste(char_vals, collapse = "|")
+      }
+    }
+    
+    # Ensure all columns exist
+    for (col in file_data$num_cols) {
+      if (!(paste0(col, "_op") %in% names(new_row))) {
+        new_row[[paste0(col, "_op")]] <- ""
+        new_row[[paste0(col, "_val")]] <- NA_real_
+      }
+    }
+    for (col in file_data$char_cols) {
+      if (!(paste0(col, "_vals") %in% names(new_row))) {
+        new_row[[paste0(col, "_vals")]] <- ""
+      }
+    }
+    
+    # Merge with existing data
+    if (nrow(table_data$data) == 0) {
+      table_data$data <- new_row
+    } else {
+      all_cols <- unique(c(names(table_data$data), names(new_row)))
+      for (col in all_cols) {
+        if (!(col %in% names(table_data$data))) table_data$data[[col]] <- NA
+        if (!(col %in% names(new_row))) new_row[[col]] <- NA
+      }
+      table_data$data <- rbind(table_data$data, new_row)
     }
   })
   
-  # Observe delete button clicks
-  lapply(1:100, function(i) {  # Create observers for up to 100 rows
+  # Render rules table
+  output$dynamic_table <- renderUI({
+    if (!file_data$is_valid || nrow(table_data$data) == 0) {
+      return("No rules added yet.")
+    }
+    
+    header_cols <- c("Dataset", "Chr")
+    applied_cols <- c()
+    
+    for (col in file_data$num_cols) {
+      if (any(!is.na(table_data$data[[paste0(col, "_val")]]) & 
+              table_data$data[[paste0(col, "_op")]] != "")) {
+        applied_cols <- c(applied_cols, col)
+        header_cols <- c(header_cols, col)
+      }
+    }
+    for (col in file_data$char_cols) {
+      if (any(table_data$data[[paste0(col, "_vals")]] != "")) {
+        applied_cols <- c(applied_cols, col)
+        header_cols <- c(header_cols, col)
+      }
+    }
+    
+    header_cols <- c(header_cols, "Action")
+    
+    table_rows <- lapply(1:nrow(table_data$data), function(i) {
+      row_data <- table_data$data[i, ]
+      cells <- list(
+        tags$td(row_data$dataset),
+        tags$td(row_data$chr)
+      )
+      
+      for (col in applied_cols) {
+        if (col %in% file_data$num_cols) {
+          op <- row_data[[paste0(col, "_op")]]
+          val <- row_data[[paste0(col, "_val")]]
+          if (!is.na(val) && op != "") {
+            cells[[length(cells) + 1]] <- tags$td(paste0(col, " ", op, " ", val))
+          } else {
+            cells[[length(cells) + 1]] <- tags$td("-")
+          }
+        } else {
+          vals <- row_data[[paste0(col, "_vals")]]
+          if (vals != "") {
+            cells[[length(cells) + 1]] <- tags$td(paste0(col, ": ", vals))
+          } else {
+            cells[[length(cells) + 1]] <- tags$td("-")
+          }
+        }
+      }
+      
+      cells[[length(cells) + 1]] <- tags$td(
+        actionButton(paste0("delete_", i), "Delete", class = "btn-danger btn-sm")
+      )
+      
+      tags$tr(cells)
+    })
+    
+    tags$table(
+      class = "table table-striped",
+      tags$thead(tags$tr(lapply(header_cols, tags$th))),
+      tags$tbody(table_rows)
+    )
+  })
+  
+  # Delete buttons
+  lapply(1:100, function(i) {
     observeEvent(input[[paste0("delete_", i)]], {
-      # Remove the corresponding row from the data
       if (i <= nrow(table_data$data)) {
         table_data$data <- table_data$data[-i, ]
       }
     })
   })
   
-  # Display information about the uploaded files
+  # File info
   output$file_info <- renderPrint({
     if (is.null(input$file_input)) {
-      return("No files uploaded yet.")
+      return("No file uploaded yet.")
     } else {
-      # Display file names and sizes
-      file_info <- data.frame(
-        Name = input$file_input$name
-        #Size = input$file_input$size,
-        #Type = input$file_input$type
-      )
-      file_info
+      data.frame(Name = input$file_input$name, Size = input$file_input$size)
     }
   })
   
-  # Reactive value to store the path to the zip archive
-  zip_path <- reactiveVal(NULL)
-  
-  # Observe the "Apply Rules and Save Output" button click
+  # Apply rules button
   observeEvent(input$apply_rules_btn, {
-    if (is.null(input$file_input)) {
-      showNotification("No files uploaded!", type = "error")
+    if (!file_data$is_valid) {
+      showNotification("No valid file uploaded!", type = "error")
       return()
     }
     
@@ -184,185 +344,179 @@ server <- function(input, output, session) {
       return()
     }
     
-    # Create a temporary directory for output
     output_dir <- file.path(tempdir(), "output")
     if (!dir.exists(output_dir)) {
       dir.create(output_dir, recursive = TRUE)
     }
     
-    summary_table <- data.frame(
-      filename = character(),
-      dataset = character(),
-      chr = character(),
-      width = numeric(),
-      regulation = character(),
-      n_any_quality = character(),
-      n_signif_quality = character(),
-      p_adj = numeric(),
-      log2FC = numeric(),
-      n_regions = numeric(),
-      stringsAsFactors = FALSE
-    )
-    
-    # init the files counter to make prefix
+    summary_table <- data.frame(stringsAsFactors = FALSE)
     file_name_ix <- 1
+    file_name <- tools::file_path_sans_ext(input$file_input$name)
     
-    # Start progress bar
-    withProgress(message = "Processing files", value = 0, {
-      # Loop through each uploaded file
-      
+    withProgress(message = "Processing rules", value = 0, {
       for (rule_idx in 1:nrow(table_data$data)) {
         rule <- table_data$data[rule_idx, ]
+        data <- file_data$data
         
-        files_list <- sort(input$file_input$name)
-        input_sorted <- input$file_input[order(input$file_input$name),]
+        # Filtering
+        filter_conditions <- rep(TRUE, nrow(data))
         
-        for (file_idx in seq_along(input_sorted$name)) {
-          file <- input_sorted$datapath[file_idx]
-          file_name <- tools::file_path_sans_ext(input_sorted$name[file_idx])
+        chr_col <- "chr"
+        
+        # Chromosome filter
+        if (rule$chr != "ALL") {
+          fvec <- c()
+          if (rule$chr == "noX") fvec <- "chrX"
+          if (rule$chr == "noY") fvec <- "chrY"
+          if (rule$chr == "noXY") fvec <- c("chrX", "chrY")
           
-          # Read the Excel file
-          data <- read_excel(file)
-          data <- data[,1:9]
-          colnames(data) <- c("chr", "start", "end", "width", "regulation", "n_any_quality", "n_signif_quality", "p_adj", "log2FC")
-          
-          # Apply filtering rules using base R
-          filter_conditions <- TRUE
-          if (rule$chr != "ALL") {
-            fvec <- c()
-            if (rule$chr == "noX") fvec <- "chrX"
-            if (rule$chr == "noY") fvec <- "chrY"
-            if (rule$chr == "noXY") fvec <- c("chrX", "chrY")
-            
-            filter_conditions <- filter_conditions & !(data$chr %in% fvec)
-          }
-          if (rule$width != 1000000) {
-            filter_conditions <- filter_conditions & (data$width <= rule$width)
-          }
-          if (rule$regulation != "ALL") {
-            filter_conditions <- filter_conditions & (data$regulation == rule$regulation)
-          }
-          if (rule$n_any_quality != "") {
-            filter_conditions <- filter_conditions & (data$n_any_quality %in% as.numeric(unlist(strsplit(rule$n_any_quality, ","))))
-          }
-          if (rule$n_signif_quality != "") {
-            filter_conditions <- filter_conditions & (data$n_signif_quality %in% as.numeric(unlist(strsplit(rule$n_signif_quality, ","))))
-          }
-          if (rule$p_adj != 1.0) {
-            filter_conditions <- filter_conditions & (data$p_adj < rule$p_adj)
-          }
-          if (rule$log2FC != 0.0) {
-            filter_conditions <- filter_conditions & (abs(data$log2FC) > rule$log2FC)
-          }
-          
-          # Filter the data
-          filtered_data <- data[filter_conditions, ]
-          
-          # Generate directory name based on non-default parameters
-          non_default_params <- c()
-          non_default_params <- c(non_default_params, paste0("Chr=", rule$chr))
-          # if (rule$chr != "ALL") {
-          #   non_default_params <- c(non_default_params, paste0("chr=", rule$chr))
-          # }
-          
-          if (rule$width != 1000000) {
-            non_default_params <- c(non_default_params, paste0("Width=", rule$width))
-          }
-          
-          if (rule$regulation != "ALL") {
-            regulat <- ifelse(rule$regulation == "positive", "PosReg", "NegReg") 
-            non_default_params <- c(non_default_params, regulat)
-            
-          } else {
-            non_default_params <- c(non_default_params, "PosNeg")
-          }
-          
-          if (rule$n_any_quality != "") {
-            non_default_params <- c(non_default_params, paste0("NAny=", gsub(",","-",rule$n_any_quality)))
-          }
-          if (rule$n_signif_quality != "") {
-            non_default_params <- c(non_default_params, paste0("NSignif=", gsub(",","-",rule$n_signif_quality)))
-          }
-          if (rule$p_adj != 1.0) {
-            non_default_params <- c(non_default_params, paste0("PAdj=", rule$p_adj))
-          }
-          
-          #if (rule$log2FC != 1.0) {
-          non_default_params <- c(non_default_params, paste0("log2FC=", rule$log2FC))
-          #}
-          
-          # Create directory name
-          dir_name <- paste0(rule$dataset, "_", paste(non_default_params, collapse = "_"))
-          rule_output_dir <- file.path(output_dir, dir_name)
-          if (!dir.exists(rule_output_dir)) {
-            dir.create(rule_output_dir, recursive = TRUE)
-          }
-          
-          # Calculate number of regions in filtered data
-          number_of_rows <- nrow(filtered_data)
-          out_name <- gsub("_overlap_manorm2_vs_diffreps", "", file_name)
-          out_prefix <- str_pad(file_name_ix, width = 2, side = "left", pad="0")
-          out_name <- paste0(out_prefix,"_",dir_name,"_",out_name,"_n=",number_of_rows)
-          
-          # Save as .bed
-          bed_file <- file.path(rule_output_dir, paste0(out_name, ".bed"))
-          write.table(filtered_data[,1:3], bed_file, sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
-          
-          # Save as .xlsx using writexl
-          xlsx_file <- file.path(rule_output_dir, paste0(out_name, ".xlsx"))
-          write_xlsx(filtered_data[,1:3], xlsx_file)
-          
-          # Create summary table with filenames and number of regions
-          tmp_summary <- data.frame(
-            filename = out_name,
-            dataset = rule$dataset,
-            chr = rule$chr,
-            width = rule$width,
-            regulation = rule$regulation,
-            n_any_quality = rule$n_any_quality,
-            n_signif_quality = rule$n_signif_quality,
-            p_adj = rule$p_adj,
-            log2FC = rule$log2FC,
-            n_regions = number_of_rows,
-            stringsAsFactors = FALSE
-          )
-          
-          summary_table <- rbind(summary_table, tmp_summary)
-          file_name_ix <- file_name_ix + 1
+          filter_conditions <- filter_conditions & !(data[[chr_col]] %in% fvec)
         }
-
-        # Update progress bar
-        #incProgress(1 / length(input_sorted$name), detail = paste("Processing file", file_idx, "of", length(input_sorted$name)))
+        
+        # Numeric filters
+        for (col in file_data$num_cols) {
+          op <- rule[[paste0(col, "_op")]]
+          val <- rule[[paste0(col, "_val")]]
+          
+          if (!is.na(val) && op != "") {
+            col_data <- data[[col]]
+            if (op == "lt") filter_conditions <- filter_conditions & (col_data < val)
+            else if (op == "le") filter_conditions <- filter_conditions & (col_data <= val)
+            else if (op == "eq") filter_conditions <- filter_conditions & (col_data == val)
+            else if (op == "ge") filter_conditions <- filter_conditions & (col_data >= val)
+            else if (op == "gt") filter_conditions <- filter_conditions & (col_data > val)
+          }
+        }
+        
+        # Character filters
+        for (col in file_data$char_cols) {
+          vals_str <- rule[[paste0(col, "_vals")]]
+          if (vals_str != "") {
+            vals <- unlist(strsplit(vals_str, "\\|"))
+            filter_conditions <- filter_conditions & (data[[col]] %in% vals)
+          }
+        }
+        
+        filtered_data <- data[filter_conditions, ]
+        
+        # Build directory name
+        non_default_params <- c()
+        non_default_params <- c(non_default_params, paste0("Chr=", rule$chr))
+        
+        for (col in file_data$num_cols) {
+          op <- rule[[paste0(col, "_op")]]
+          val <- rule[[paste0(col, "_val")]]
+          if (!is.na(val) && op != "") {
+            col_name <- gsub(" ", "_", col)
+            non_default_params <- c(non_default_params, paste0(col_name, "_", op, "_", val))
+          }
+        }
+        
+        for (col in file_data$char_cols) {
+          vals_str <- rule[[paste0(col, "_vals")]]
+          if (vals_str != "") {
+            col_name <- gsub(" ", "_", col)
+            vals_clean <- gsub(" ", "_", gsub("\\|", "-", vals_str))
+            non_default_params <- c(non_default_params, paste0(col_name, "_", vals_clean))
+          }
+        }
+        
+        dir_name <- paste0(rule$dataset, "_", paste(non_default_params, collapse = "_"))
+        rule_output_dir <- file.path(output_dir, dir_name)
+        if (!dir.exists(rule_output_dir)) {
+          dir.create(rule_output_dir, recursive = TRUE)
+        }
+        
+        # Get column references
+        col_names_lower <- tolower(colnames(data))
+        start_col <- colnames(data)[which(col_names_lower == "start")[1]]
+        end_col <- colnames(data)[which(col_names_lower == "end")[1]]
+        
+        # Prepare output:
+        # BED = chr/start/end only; XLSX = original column order excluding "_vs_" columns
+        output_data_bed <- filtered_data[, c(chr_col, start_col, end_col)]
+        colnames(output_data_bed) <- c("chr", "start", "end")
+        
+        xlsx_cols <- colnames(filtered_data)
+        xlsx_cols <- xlsx_cols[!grepl("_vs_", xlsx_cols, ignore.case = TRUE)]
+        output_data_xlsx <- filtered_data[, xlsx_cols, drop = FALSE]
+        number_of_rows <- nrow(output_data_bed)
+        
+        out_prefix <- str_pad(file_name_ix, width = 2, side = "left", pad = "0")
+        out_name <- paste0(out_prefix, "_", dir_name, "_", file_name, "_n=", number_of_rows)
+        
+        # Save files
+        bed_file <- file.path(rule_output_dir, paste0(out_name, ".bed"))
+        write.table(output_data_bed, bed_file, sep = "\t", row.names = FALSE, col.names = FALSE, quote = FALSE)
+        
+        xlsx_file <- file.path(rule_output_dir, paste0(out_name, ".xlsx"))
+        write_xlsx(output_data_xlsx, xlsx_file, col_names = TRUE)
+        
+      # Add to summary
+        summary_row <- data.frame(
+          filename = out_name,
+          inputfile = input$file_input$name,
+          dataset = rule$dataset,
+          chr = rule$chr,
+          n_regions = number_of_rows,
+          stringsAsFactors = FALSE
+        )
+        
+        for (col in file_data$num_cols) {
+          op <- rule[[paste0(col, "_op")]]
+          val <- rule[[paste0(col, "_val")]]
+          if (!is.na(val) && op != "") {
+            summary_row[[col]] <- paste0(op, val)
+          } else {
+            summary_row[[col]] <- ""
+          }
+        }
+        
+        for (col in file_data$char_cols) {
+          vals_str <- rule[[paste0(col, "_vals")]]
+          summary_row[[col]] <- vals_str
+        }
+        
+        if (nrow(summary_table) == 0) {
+          summary_table <- summary_row
+        } else {
+          all_cols <- unique(c(names(summary_table), names(summary_row)))
+          for (col in all_cols) {
+            if (!(col %in% names(summary_table))) summary_table[[col]] <- NA
+            if (!(col %in% names(summary_row))) summary_row[[col]] <- NA
+          }
+          summary_table <- rbind(summary_table, summary_row)
+        }
+        
+        file_name_ix <- file_name_ix + 1
+        
         incProgress(1 / nrow(table_data$data), detail = paste("Processing rule", rule_idx, "of", nrow(table_data$data)))
       }
     })
     
-    # Save summary table as .xlsx
-    write_xlsx(summary_table, file.path(output_dir, "summary_table.xlsx"), col_names = T)
+    write_xlsx(summary_table, file.path(output_dir, "summary_table.xlsx"), col_names = TRUE)
     
-    # Create a zip archive of the output directory
     zip_file <- file.path(tempdir(), "output.zip")
-    file.remove(zip_file)
+    if (file.exists(zip_file)) file.remove(zip_file)
     
-    ## To pack only the final dir without whole tree 
     current_dir <- getwd()
     setwd(output_dir)
     zip(zip_file, files = "./", extras = "-r")
     setwd(current_dir)
     unlink(output_dir, recursive = TRUE)
-    zip_path(zip_file)  # Store the path to the zip file
     
-    showNotification("Rules applied and output saved successfully! Click 'Download Output' to download the zip archive.", type = "message")
+    zip_path(zip_file)
+    showNotification("Rules applied successfully! Click 'Download Output' to download.", type = "message")
   })
   
-  # Render the download link for the zip archive
+  # Download UI
   output$download_ui <- renderUI({
     if (!is.null(zip_path())) {
       downloadButton("download_btn", "Download Output")
     }
   })
   
-  # Handle the download of the zip archive
+  # Download handler
   output$download_btn <- downloadHandler(
     filename = function() {
       paste0("output_", Sys.Date(), ".zip")
@@ -373,5 +527,4 @@ server <- function(input, output, session) {
   )
 }
 
-# Run the application 
 shinyApp(ui = ui, server = server)
