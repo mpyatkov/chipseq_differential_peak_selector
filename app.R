@@ -9,6 +9,20 @@ library(stringr)
 ui <- fluidPage(
   titlePanel("Dynamic Filtering for ChIP-seq Pipeline Output"),
   
+  tags$head(
+    tags$style(HTML("
+      /* Highlight numeric inputs when outside/inside min-max range */
+      .form-control[type='number']:out-of-range, input[type='number']:out-of-range {
+        border-color: #d9534f;
+        box-shadow: 0 0 0 .2rem rgba(217,83,79,.25);
+        background-color: #fff5f5;
+      }
+      .form-control[type='number']:in-range, input[type='number']:in-range {
+        border-color: #5cb85c;
+      }
+    "))
+  ),
+  
   sidebarLayout(
     sidebarPanel(
       helpText(tags$span("Note: Columns containing '_vs_' will be ignored during file upload.", style = "color: #d9534f;")),
@@ -42,6 +56,7 @@ server <- function(input, output, session) {
     dynamic_cols = NULL,
     num_cols = NULL,
     char_cols = NULL,
+    num_ranges = NULL,
     is_valid = FALSE,
     validation_msg = ""
   )
@@ -57,6 +72,7 @@ server <- function(input, output, session) {
       file_data$dynamic_cols <- NULL
       file_data$num_cols <- NULL
       file_data$char_cols <- NULL
+      file_data$num_ranges <- NULL
       file_data$validation_msg <- "No file uploaded yet."
       return()
     }
@@ -101,10 +117,56 @@ server <- function(input, output, session) {
       
       num_cols <- c()
       char_cols <- c()
+      num_ranges <- list()
       
       for (col in dynamic_col_names) {
-        if (is.numeric(data[[col]])) {
+        v <- data[[col]]
+        
+        if (is.numeric(v)) {
+          finite_v <- v[is.finite(v)]
+          min_val <- if (length(finite_v)) min(finite_v, na.rm = TRUE) else NA_real_
+          max_val <- if (length(finite_v)) max(finite_v, na.rm = TRUE) else NA_real_
+          
+          if (!is.na(min_val) && !is.na(max_val)) {
+            v[v == Inf] <- max_val
+            v[v == -Inf] <- min_val
+          } else {
+            v[is.infinite(v)] <- NA_real_
+          }
+          
+          data[[col]] <- v
           num_cols <- c(num_cols, col)
+          num_ranges[[col]] <- c(min_val, max_val)
+          
+        } else if (is.character(v)) {
+          tokens <- trimws(v)
+          idx <- !is.na(tokens) & tokens != ""
+          t <- tokens[idx]
+          is_num <- suppressWarnings(!is.na(as.numeric(t)))
+          is_plus_inf <- grepl("^[+]?[Ii][Nn][Ff]$", t)
+          is_minus_inf <- grepl("^-[Ii][Nn][Ff]$", t)
+          
+          if (all(is_num | is_plus_inf | is_minus_inf)) {
+            numeric_tokens <- suppressWarnings(as.numeric(t[is_num]))
+            finite_tokens <- numeric_tokens[is.finite(numeric_tokens)]
+            min_val <- if (length(finite_tokens)) min(finite_tokens, na.rm = TRUE) else NA_real_
+            max_val <- if (length(finite_tokens)) max(finite_tokens, na.rm = TRUE) else NA_real_
+            
+            new_num <- rep(NA_real_, length(v))
+            new_num[idx][is_num] <- suppressWarnings(as.numeric(t[is_num]))
+            if (!is.na(min_val) && !is.na(max_val)) {
+              new_num[idx][is_plus_inf] <- max_val
+              new_num[idx][is_minus_inf] <- min_val
+            } else {
+              new_num[idx][is_plus_inf | is_minus_inf] <- NA_real_
+            }
+            
+            data[[col]] <- new_num
+            num_cols <- c(num_cols, col)
+            num_ranges[[col]] <- c(min_val, max_val)
+          } else {
+            char_cols <- c(char_cols, col)
+          }
         } else {
           char_cols <- c(char_cols, col)
         }
@@ -114,6 +176,7 @@ server <- function(input, output, session) {
       file_data$dynamic_cols <- dynamic_col_names
       file_data$num_cols <- num_cols
       file_data$char_cols <- char_cols
+      file_data$num_ranges <- num_ranges
       file_data$is_valid <- TRUE
       file_data$validation_msg <- paste("File loaded successfully with", length(dynamic_col_names), "dynamic columns.")
       
@@ -169,7 +232,19 @@ server <- function(input, output, session) {
                                               ">=" = "ge", ">" = "gt"),
                                   selected = "lt",
                                   width = "100%")),
-            column(7, numericInput(paste0("val_", col), NULL, value = NA, width = "100%"))
+            column(7, tagList(
+              numericInput(paste0("val_", col), NULL, value = NA,
+                           min = file_data$num_ranges[[col]][1],
+                           max = file_data$num_ranges[[col]][2],
+                           width = "100%"),
+              tags$script(HTML(sprintf(
+                "var el=document.getElementById('%s'); if(el){el.setAttribute('placeholder','%s - %s');}",
+                session$ns(paste0("val_", col)),
+                format(file_data$num_ranges[[col]][1], digits = 5),
+                format(file_data$num_ranges[[col]][2], digits = 5)
+                
+              )))
+            ))
           )
         )
     }
