@@ -25,7 +25,9 @@ ui <- fluidPage(
   
   sidebarLayout(
     sidebarPanel(
-      helpText(tags$span("Note: Columns containing '_vs_' will be ignored during file upload.", style = "color: #d9534f;")),
+      helpText(tags$span("Note: Columns containing '_vs_' will be ignored during file upload.", style = "color: #d9534f;margin: 0;")),
+      helpText(tags$span("Note: Reading only first 13 columns. Empty columns will be skipped.", style = "color: #d9534f;margin: 0;")),
+      helpText(tags$span("Note: chr/seqnames, start, end columns are required", style = "color: #d9534f;margin: 0;")),
       fileInput("file_input", "Choose Excel File", multiple = FALSE, accept = c(".xlsx")),
       
       textInput("dataset", "Dataset", value = "DatasetID"),
@@ -78,7 +80,10 @@ server <- function(input, output, session) {
     }
     
     tryCatch({
-      data <- read_excel(input$file_input$datapath)
+      ## read first 13 columns
+      data <- read_excel(input$file_input$datapath, range = cell_cols("A:M"))
+      ## remove empty columns with placeholder names
+      data <- data[grep("^\\.\\.\\.\\d+$", names(data), invert = TRUE)]
       
       if (ncol(data) < 4) {
         file_data$is_valid <- FALSE
